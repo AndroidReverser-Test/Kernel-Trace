@@ -14,7 +14,7 @@ struct rb_root {
 
 struct my_key_value {
     unsigned long key;                // 键 - 整型
-    char *value;            // 值 - 字符串
+    void *value;            // 值
     struct rb_node node;    // 红黑树节点
 };
 
@@ -33,7 +33,7 @@ static inline void rb_link_node(struct rb_node *node, struct rb_node *parent,str
 }
 
 
-int insert_key_value(struct rb_root *root, unsigned long key, const char *value, int value_len)
+int insert_key_value(struct rb_root *root, unsigned long key, const void *value, int value_len)
 {
     struct rb_node **new = &(root->rb_node);
     struct rb_node *parent = NULL;
@@ -58,7 +58,7 @@ int insert_key_value(struct rb_root *root, unsigned long key, const char *value,
         return -1;
 
     // 分配字符串内存并复制值
-    data->value = kmalloc(strlen(value) + 1, GFP_KERNEL);
+    data->value = kmalloc(value_len + 1, GFP_KERNEL);
     if (!data->value) {
         kfree(data);
         return -1;

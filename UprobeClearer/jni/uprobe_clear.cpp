@@ -8,5 +8,7 @@ int main(int argc, char const *argv[])
 {
     clear_all_uprobes();
     printf("success clear all uprobes\n");
+
+
     return 0;
 }

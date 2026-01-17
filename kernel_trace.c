@@ -8,11 +8,12 @@
 #include <asm/current.h>
 #include <linux/string.h>
 #include <syscall.h>
+#include <kputils.h>
 #include <hook.h>
 #include "kernel_trace.h"
 
 KPM_NAME("kernel_trace");
-KPM_VERSION("4.5.0");
+KPM_VERSION("6.0.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Test");
 KPM_DESCRIPTION("use uprobe trace some fun in kpm");
@@ -30,11 +31,19 @@ int (*bpf_probe_read_user)(void *dst, u32 size,const void __user *unsafe_ptr) = 
 
 unsigned long (*get_unmapped_area)(struct file *file, unsigned long addr, unsigned long len,unsigned long pgoff, unsigned long flags) = 0;
 
-char *(*special_mapping_name)(struct vm_area_struct *vma) = 0;
+char *(*file_path)(struct file *filp, char *buf, int buflen) = 0;
+char *(*mkstrdup)(const char *s, gfp_t gfp) = 0;
+struct file *(*filp_open)(const char *filename, int flags, umode_t mode) = 0;
+ssize_t (*kernel_read)(struct file *file, void *buf, size_t count, loff_t *pos) = 0;
+int (*filp_close)(struct file *filp, fl_owner_t id) = 0;
+void *(*vmalloc)(unsigned long size) = 0;
+void (*vfree)(const void *addr) = 0;
+struct page *(*vmalloc_to_page)(const void *vmalloc_addr) = 0;
+
 
 void *install_special_mapping_addr;
 void *create_xol_area_addr;
-void *copy_insn_addr;
+void *do_read_cache_page_addr;
 
 
 char file_name[MAX_PATH_LEN];
@@ -42,28 +51,11 @@ uid_t target_uid = -1;
 unsigned long fun_offsets[MAX_HOOK_NUM];
 int hook_num = 0;
 struct rb_root fun_info_tree = RB_ROOT;
-struct rb_root fix_ins_tree = RB_ROOT;
+struct rb_root fix_idx_tree = RB_ROOT;
 static struct inode *inode;
 unsigned long module_base = 0;
 static struct uprobe_consumer trace_uc;
-
-
-void before_copy_insn(hook_fargs5_t *args, void *udata){
-    struct my_key_value *ins_info;
-    loff_t offset = (loff_t)args->arg4;
-    ins_info = search_key_value(&fix_ins_tree,offset);
-    if(ins_info){
-       memcpy((void *)args->arg2,ins_info->value,INS_LEN);
-//       logkd("+Test-Log+ offset:%lx,fix ins:%x %x %x %x\n",offset,ins_info->value[0],ins_info->value[1],ins_info->value[2],ins_info->value[3]);
-
-       rb_erase(&ins_info->node,&fix_ins_tree);
-       kfree(ins_info->value);
-       kfree(ins_info);
-
-       args->ret = 0;
-       args->skip_origin = 1;
-    }
-}
+static struct file *fix_file = NULL;
 
 void before_create_xol_area(hook_fargs1_t *args, void *udata){
     unsigned long vaddr = (unsigned long )args->arg0;
@@ -86,14 +78,62 @@ void before_install_special_mapping(hook_fargs6_t *args, void *udata){
     }
 }
 
+void before_do_read_cache_page(hook_fargs5_t *args, void *udata){
+
+    char *mfile_path;
+    struct file *filp = (struct file*)args->arg3;
+    unsigned long index = (unsigned long)args->arg1;
+
+    if(fix_file && filp){
+        char *path_buf = kmalloc(MAX_PATH_LEN, GFP_KERNEL);
+        mfile_path = file_path(filp, path_buf, MAX_PATH_LEN);
+        if (!mfile_path) {
+            kfree(path_buf);
+        }else{
+            mfile_path = mkstrdup(mfile_path, GFP_KERNEL);
+            kfree(path_buf);
+            if(strcmp(mfile_path,file_name)==0){
+
+                loff_t pos;
+                struct my_key_value *fix_info;
+                fix_info = search_key_value(&fix_idx_tree,index);
+                if(likely(fix_info)){
+                    index = *((unsigned int*)fix_info->value);
+                }
+
+                pos = (loff_t)(index*0x1000);
+                char *mbytes = NULL;
+                mbytes = vmalloc(PAGE_SIZE);
+                if (!mbytes) {
+                    logke("+Test-Log+ Failed to allocate memory with vmalloc\n");
+                    return;
+                }
+                int rret = kernel_read(fix_file, mbytes, PAGE_SIZE, &pos);
+                if (rret < 0) {
+                    logke("+Test-Log+ Failed to read file: %ld at %llx\n", rret,pos);
+                    return;
+                }
+
+                logkd("+Test-Log+ index:%llx,pos:%llx,file_bytes:%x %x %x %x\n",index,pos,mbytes[0],mbytes[1],mbytes[2],mbytes[3]);
+                struct page *mpage = vmalloc_to_page(mbytes);
+                args->ret = (uint64_t)mpage;
+                args->skip_origin = 1;
+                vfree(mbytes);
+                return;
+            }
+        }
+
+    }
+}
+
 void before_mincore(hook_fargs3_t *args, void *udata){
     int trace_flag = (int)syscall_argn(args, 1);
     if(trace_flag<TRACE_FLAG || trace_flag>TRACE_FLAG+CLEAR_UPROBE){
         return;
     }
 
-    int trace_info = trace_flag-TRACE_FLAG;
-    if(trace_info==SET_FUN_INFO){
+    int trace_flag_num = trace_flag-TRACE_FLAG;
+    if(trace_flag_num==SET_FUN_INFO){
         if(unlikely(hook_num==MAX_HOOK_NUM)){
             logke("+Test-Log+ MAX_HOOK_NUM:%d\n",MAX_HOOK_NUM);
             goto error_out;
@@ -104,35 +144,36 @@ void before_mincore(hook_fargs3_t *args, void *udata){
             goto error_out;
         }
 
-        unsigned long fun_offset = (unsigned long)syscall_argn(args, 0);
-        const char __user *tfun_name = (typeof(tfun_name))syscall_argn(args, 2);
+        void* uuprobe_item = (void*)syscall_argn(args, 2);
+        struct uprobe_item_info *uprobe_item = NULL;
+        uprobe_item = kmalloc(sizeof(struct uprobe_item_info), GFP_KERNEL);
+        if(!uprobe_item){
+            logke("+Test-Log+ Failed to allocate memory with kmalloc\n");
+            goto error_out;
+        }
+
+        if(bpf_probe_read_user(uprobe_item,sizeof(struct uprobe_item_info),uuprobe_item)<0){
+            logke("+Test-Log+ bpf_probe_read_user error\n");
+            goto error_out;
+        }
+
+
+        unsigned long fun_offset = (unsigned long)uprobe_item->fun_offset;
         char fun_name[MAX_FUN_NAME];
-        compat_strncpy_from_user(fun_name,tfun_name,sizeof(fun_name));
+        compat_strncpy_from_user(fun_name,uprobe_item->fun_name,sizeof(fun_name));
+
         int insert_ret = insert_key_value(&fun_info_tree,fun_offset,fun_name,strlen(fun_name));
         if(insert_ret==-1){
             logke("+Test-Log+ same fun 0x%llx set uprobe\n",fun_offset);
             goto error_out;
         }
         logkd("+Test-Log+ fun_name:%s,fun_offset:%llx\n",fun_name,fun_offset);
-        goto success_out;
-    }
 
-    if(trace_info==FIX_ORI_INS){
-        unsigned long rfun_offset = (unsigned long)syscall_argn(args, 0);
-        const char __user *ufix_ins = (typeof(ufix_ins))syscall_argn(args, 2);
-        char fix_ins[INS_LEN];
-        bpf_probe_read_user(fix_ins,INS_LEN,ufix_ins);
-//        logkd("+Test-Log3+ insn:%lx %lx %lx %lx\n",fix_ins[0],fix_ins[1],fix_ins[2],fix_ins[3]);
-        int insert_ins_ret = insert_key_value(&fix_ins_tree,rfun_offset,fix_ins,INS_LEN);
-        if(insert_ins_ret==-1){
-            logke("+Test-Log+ set insn for same fun 0x%llx\n",rfun_offset);
-            goto error_out;
-        }
-        goto success_out;
-    }
+        unsigned long rfun_offset = uprobe_item->uprobe_offset;
+        unsigned int f_idx = fun_offset >> PAGE_SHIFT;
+        insert_key_value(&fix_idx_tree,rfun_offset >> PAGE_SHIFT,&f_idx,4);
+        kfree(uprobe_item);
 
-    if(trace_info==SET_TARGET_UPROBE){
-        unsigned long rfun_offset = (unsigned long)syscall_argn(args, 0);
         int hret = uprobe_register(inode,rfun_offset,&trace_uc);
         if(hret<0){
             logke("+Test-Log+ set uprobe error in 0x%llx\n",rfun_offset);
@@ -141,25 +182,32 @@ void before_mincore(hook_fargs3_t *args, void *udata){
 
         fun_offsets[hook_num] = rfun_offset;
         hook_num++;
-//        logkd("+Test-Log+ rfun_offset:%llx\n",rfun_offset);
+
         goto success_out;
     }
 
-    if(trace_info==SET_MODULE_BASE){
-        module_base = (unsigned long)syscall_argn(args, 0);
-        logkd("+Test-Log+ set module_base:0x%llx\n",module_base);
-        goto success_out;
-    }
 
-    if(trace_info==SET_TARGET_UID){
-        target_uid = (uid_t)syscall_argn(args, 0);
+    if(trace_flag_num==SET_TRACE_INFO){
+        void* utrace_info = (void*)syscall_argn(args, 2);
+        struct trace_init_info *base_info = NULL;
+        base_info = kmalloc(sizeof(struct trace_init_info), GFP_KERNEL);
+        if(!base_info){
+            logke("+Test-Log+ Failed to allocate memory with kmalloc\n");
+            goto error_out;
+        }
+
+        if(bpf_probe_read_user(base_info,sizeof(struct trace_init_info),utrace_info)<0){
+            logke("+Test-Log+ bpf_probe_read_user error\n");
+            goto error_out;
+        }
+
+        target_uid = (uid_t)base_info->uid;
         logkd("+Test-Log+ set target_uid:%d\n",target_uid);
-        goto success_out;
-    }
 
-    if(trace_info==SET_TARGET_FILE){
-        const char __user *filename = (typeof(filename))syscall_argn(args, 2);
-        compat_strncpy_from_user(file_name,filename,sizeof(file_name));
+        module_base = (unsigned long)base_info->module_base;
+        logkd("+Test-Log+ set module_base:0x%llx\n",module_base);
+
+        compat_strncpy_from_user(file_name,base_info->tfile_name,sizeof(file_name));
         logkd("+Test-Log+ set target_file_name:%s\n",file_name);
         struct path path;
         int fret = kern_path(file_name, LOOKUP_FOLLOW, &path);
@@ -170,17 +218,34 @@ void before_mincore(hook_fargs3_t *args, void *udata){
         inode = igrab(path.dentry->d_inode);
         path_put(&path);
         logkd("+Test-Log+ success set file inode\n");
+
+        char fix_file_name[MAX_PATH_LEN];
+        compat_strncpy_from_user(fix_file_name,base_info->fix_file_name,sizeof(fix_file_name));
+        if(strlen(fix_file_name)!=0){
+            if (fix_file) {
+                filp_close(fix_file, NULL);
+            }
+            fix_file = filp_open(fix_file_name, O_RDONLY | O_LARGEFILE, 0);
+            if (!fix_file) {
+                logke("+Test-Log+ Failed to open file:%s\n",fix_file_name);
+                goto error_out;
+            }
+            logkd("+Test-Log+ set fix_file_name:%s\n",fix_file_name);
+        }
+        kfree(base_info);
+
         goto success_out;
+
     }
 
-    if(trace_info==CLEAR_UPROBE){
-        rcu_read_unlock();//解锁，不然内核会崩
+
+    if(trace_flag_num==CLEAR_UPROBE){
         for (int i = 0; i < hook_num; ++i) {
             uprobe_unregister(inode,fun_offsets[i],&trace_uc);
         }
         hook_num = 0;
         destroy_entire_tree(&fun_info_tree);
-        destroy_entire_tree(&fix_ins_tree);
+        destroy_entire_tree(&fix_idx_tree);
         logkd("+Test-Log+ success clear all uprobes\n");
         goto success_out;
     }
@@ -225,6 +290,33 @@ no_target_out:
     return 0;
 }
 
+static unsigned long get_do_read_cache_page_addr(){
+    unsigned long read_cache_page_addr = kallsyms_lookup_name("read_cache_page");
+    logkd("+Test-Log+ read_cache_page_addr:%llx\n",read_cache_page_addr);
+    unsigned int* ins = (unsigned int*)(read_cache_page_addr);
+    for (int i = 0; i < 10; ++i) {
+        unsigned int instr = ins[i];
+
+        if ((instr >> 26) == 0x25) {
+            logkd("+Test-Log+ bl ins=>i:%d,ins:%lx\n",i,instr);
+
+            int32_t imm26 = instr & 0x03FFFFFF;
+            // 符号扩展（26位有符号 → 32位有符号）
+            if (imm26 & 0x02000000) {  // 检查 bit25（第 26 位的符号位）
+                imm26 |= 0xFC000000;   // 负数的符号扩展
+            }
+
+            int64_t offset = (int64_t)((int32_t)imm26);
+            offset *= 4;
+            unsigned long bl_addr = read_cache_page_addr + i*4;
+            unsigned long do_read_cache_page_addr = bl_addr + offset;
+            return do_read_cache_page_addr;
+        }
+    }
+
+    return 0;
+}
+
 
 static long kernel_trace_init(const char *args, const char *event, void *__user reserved)
 {
@@ -248,13 +340,25 @@ static long kernel_trace_init(const char *args, const char *event, void *__user 
     bpf_probe_read_user = (typeof(bpf_probe_read_user))kallsyms_lookup_name("bpf_probe_read_user");
 
     get_unmapped_area = (typeof(get_unmapped_area))kallsyms_lookup_name("get_unmapped_area");
-    special_mapping_name = (typeof(special_mapping_name))kallsyms_lookup_name("special_mapping_name");
+    file_path = (typeof(file_path))kallsyms_lookup_name("file_path");
+    mkstrdup = (typeof(mkstrdup))kallsyms_lookup_name("kstrdup");
+    filp_open = (typeof(filp_open))kallsyms_lookup_name("filp_open");
+    kernel_read = (typeof(kernel_read))kallsyms_lookup_name("kernel_read");
+    filp_close = (typeof(filp_close))kallsyms_lookup_name("filp_close");
+    vmalloc = (typeof(vmalloc))kallsyms_lookup_name("vmalloc");
+    vfree = (typeof(vfree))kallsyms_lookup_name("vfree");
+    vmalloc_to_page = (typeof(vmalloc_to_page))kallsyms_lookup_name("vmalloc_to_page");
 
     install_special_mapping_addr = (void *)kallsyms_lookup_name("__install_special_mapping");
 
     create_xol_area_addr = (void *)kallsyms_lookup_name("__create_xol_area");
 
-    copy_insn_addr = (void *)kallsyms_lookup_name("__copy_insn");
+    unsigned long do_read_cache_page_num = get_do_read_cache_page_addr();
+    if(do_read_cache_page_num==0){
+        logke("+Test-Log+ can not get do_read_cache_page addr\n");
+        return 0;
+    }
+    do_read_cache_page_addr = (void *)do_read_cache_page_num;
 
     logkd("+Test-Log+ mtask_pid_nr_ns:%llx\n",mtask_pid_nr_ns);
     logkd("+Test-Log+ uprobe_register:%llx\n",uprobe_register);
@@ -274,19 +378,28 @@ static long kernel_trace_init(const char *args, const char *event, void *__user 
     logkd("+Test-Log+ bpf_probe_read_user:%llx\n",bpf_probe_read_user);
 
     logkd("+Test-Log+ get_unmapped_area:%llx\n",get_unmapped_area);
-    logkd("+Test-Log+ special_mapping_name:%llx\n",special_mapping_name);
+    logkd("+Test-Log+ file_path:%llx\n",file_path);
+    logkd("+Test-Log+ kstrdup:%llx\n",mkstrdup);
+    logkd("+Test-Log+ filp_open:%llx\n",filp_open);
+    logkd("+Test-Log+ kernel_read:%llx\n",kernel_read);
+    logkd("+Test-Log+ filp_close:%llx\n",filp_close);
+    logkd("+Test-Log+ vmalloc:%llx\n",vmalloc);
+    logkd("+Test-Log+ vfree:%llx\n",vfree);
+    logkd("+Test-Log+ vmalloc_to_page:%llx\n",vmalloc_to_page);
 
     logkd("+Test-Log+ install_special_mapping_addr:%llx\n",install_special_mapping_addr);
 
     logkd("+Test-Log+ create_xol_area_addr:%llx\n",create_xol_area_addr);
 
-    logkd("+Test-Log+ copy_insn_addr:%llx\n",copy_insn_addr);
+    logkd("+Test-Log+ do_read_cache_page_addr:%llx\n",do_read_cache_page_addr);
+
+
 
     if(!(mtask_pid_nr_ns && uprobe_register && uprobe_unregister
     && kern_path && igrab && path_put && rcu_read_unlock
     && rb_erase && rb_insert_color && rb_first && trace_printk
-    && bpf_probe_read_user && get_unmapped_area && special_mapping_name
-    && install_special_mapping_addr && create_xol_area_addr && copy_insn_addr)){
+    && bpf_probe_read_user && get_unmapped_area && file_path && mkstrdup && filp_open && kernel_read && filp_close && vmalloc && vfree && vmalloc_to_page
+    && install_special_mapping_addr && create_xol_area_addr && do_read_cache_page_addr)){
         logke("+Test-Log+ can not find some fun addr\n");
         return -1;
     }
@@ -311,11 +424,12 @@ static long kernel_trace_init(const char *args, const char *event, void *__user 
         return -1;
     }
 
-    err = hook_wrap5(copy_insn_addr, before_copy_insn, NULL, 0);
+    err = hook_wrap5(do_read_cache_page_addr, before_do_read_cache_page, NULL, 0);
     if(err){
-        logke("+Test-Log+ hook copy_insn error\n");
+        logke("+Test-Log+ hook do_read_cache_page error\n");
         return -1;
     }
+
 
     logkd("+Test-Log+ success init\n");
     return 0;
@@ -330,17 +444,20 @@ static long kernel_trace_control0(const char *args, char *__user out_msg, int ou
 
 static long kernel_trace_exit(void *__user reserved)
 {
-    inline_unhook_syscall(__NR_mincore, before_mincore, 0);
+    inline_unhook_syscalln(__NR_mincore, before_mincore, 0);
     unhook(install_special_mapping_addr);
     unhook(create_xol_area_addr);
-    unhook(copy_insn_addr);
+    unhook(do_read_cache_page_addr);
     rcu_read_unlock();//解锁，不然内核会崩
     for (int i = 0; i < hook_num; ++i) {
         uprobe_unregister(inode,fun_offsets[i],&trace_uc);
     }
     logkd("+Test-Log+ success clear all uprobes\n");
     destroy_entire_tree(&fun_info_tree);
-    destroy_entire_tree(&fix_ins_tree);
+    destroy_entire_tree(&fix_idx_tree);
+    if(fix_file){
+        filp_close(fix_file, NULL);
+    }
     logkd("kpm kernel_trace  exit\n");
 }
 
